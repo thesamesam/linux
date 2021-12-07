@@ -53,6 +53,9 @@ patch -p1 < %{SOURCE2}
 
 %build
 %{make} %{makeflags} KERNELRELEASE=%{KERNELRELEASE} KBUILD_BUILD_VERSION=%{release}
+%if %{with_ctf}
+%{make} %{makeflags} KERNELRELEASE=%{KERNELRELEASE} KBUILD_BUILD_VERSION=%{release} ctf
+%endif
 
 %install
 mkdir -p %{buildroot}/boot
