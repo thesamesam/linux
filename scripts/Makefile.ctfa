@@ -61,7 +61,7 @@ $(ctf-filelist): $(ctf-filelist-raw)
 	@cat $(ctf-filelist-raw) | while read -r obj; do \
 		case $$obj in \
 		$(ctf-builtins)) cat $$obj >> $(ctf-filelist);; \
-		*.a) ar t $$obj > $(ctf-filelist);; \
+		*.a) $(AR) t $$obj > $(ctf-filelist);; \
 		*.builtin) cat $$obj >> $(ctf-filelist);; \
 		*) echo "$$obj" >> $(ctf-filelist);; \
 		esac; \
@@ -75,7 +75,7 @@ $(ctf-filelist): $(ctf-filelist-raw)
 
 quiet_cmd_ctfa = CTFA
       cmd_ctfa = { echo 'int main () { return 0; } ' | \
-		gcc -x c -c -o $<.stub -; \
+		$(CC) -x c -c -o $<.stub -; \
 	$(OBJCOPY) '--remove-section=.*' --add-section=.ctf=$< \
 		 $<.stub $@; }
 
