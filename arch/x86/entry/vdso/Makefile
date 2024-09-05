@@ -132,7 +132,9 @@ KBUILD_CFLAGS_32 += -m32 -msoft-float -mregparm=0 -fpic
 KBUILD_CFLAGS_32 += -fno-stack-protector
 KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
 KBUILD_CFLAGS_32 += -fno-omit-frame-pointer
-KBUILD_CFLAGS_32 += $(call cc-option,-gctf0)
+ifdef CONFIG_CTF
+  KBUILD_CFLAGS_32 += $(call cc-option,-gctf0)
+endif
 KBUILD_CFLAGS_32 += -DDISABLE_BRANCH_PROFILING
 
 ifdef CONFIG_MITIGATION_RETPOLINE
