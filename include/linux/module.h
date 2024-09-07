@@ -186,9 +186,13 @@ extern void cleanup_module(void);
 #ifdef MODULE
 #define MODULE_FILE
 #else
+#ifdef CONFIG_CTF
 #define MODULE_FILE					                      \
 			MODULE_INFO(file, KBUILD_MODFILE);                    \
 			MODULE_INFO(objs, KBUILD_MODOBJS);
+#else
+#define MODULE_FILE MODULE_INFO(file, KBUILD_MODFILE);
+#endif
 #endif
 
 /*
