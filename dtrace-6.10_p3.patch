@@ -1,0 +1,2360 @@
+diff --git a/Documentation/dontdiff b/Documentation/dontdiff
+index 3c399f132e2db..75b9655e57914 100644
+--- a/Documentation/dontdiff
++++ b/Documentation/dontdiff
+@@ -179,7 +179,7 @@ mkutf8data
+ modpost
+ modules-only.symvers
+ modules.builtin
+-modules.builtin.modinfo
++modules.builtin.*
+ modules.nsdeps
+ modules.order
+ modversions.h*
+diff --git a/Documentation/kbuild/kbuild.rst b/Documentation/kbuild/kbuild.rst
+index 9c8d1d046ea56..79e104ffee715 100644
+--- a/Documentation/kbuild/kbuild.rst
++++ b/Documentation/kbuild/kbuild.rst
+@@ -17,6 +17,11 @@ modules.builtin
+ This file lists all modules that are built into the kernel. This is used
+ by modprobe to not fail when trying to load something builtin.
+ 
++modules.builtin.objs
++-----------------------
++This file contains object mapping of modules that are built into the kernel
++to their corresponding object files used to build the module.
++
+ modules.builtin.modinfo
+ -----------------------
+ This file contains modinfo from all modules that are built into the kernel.
+diff --git a/Documentation/process/changes.rst b/Documentation/process/changes.rst
+index 5685d7bfe4d0f..8db62fe4dadff 100644
+--- a/Documentation/process/changes.rst
++++ b/Documentation/process/changes.rst
+@@ -63,9 +63,13 @@ cpio                   any              cpio --version
+ GNU tar                1.28             tar --version
+ gtags (optional)       6.6.5            gtags --version
+ mkimage (optional)     2017.01          mkimage --version
++GNU AWK (optional)     5.1.0            gawk --version
++GNU C\ [#f2]_          12.0             gcc --version
++binutils\ [#f2]_       2.36             ld -v
+ ====================== ===============  ========================================
+ 
+ .. [#f1] Sphinx is needed only to build the Kernel documentation
++.. [#f2] These are needed at build-time when CONFIG_CTF is enabled
+ 
+ Kernel compilation
+ ******************
+@@ -198,6 +202,12 @@ platforms. The tool is available via the ``u-boot-tools`` package or can be
+ built from the U-Boot source code. See the instructions at
+ https://docs.u-boot.org/en/latest/build/tools.html#building-tools-for-linux
+ 
++GNU AWK
++-------
++
++GNU AWK is needed if you want kernel builds to generate address range data for
++builtin modules (CONFIG_BUILTIN_MODULE_RANGES).
++
+ System utilities
+ ****************
+ 
+diff --git a/Makefile b/Makefile
+index 2e5ac6ab3d476..635896f269f1f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1024,6 +1024,7 @@ include-$(CONFIG_UBSAN)		+= scripts/Makefile.ubsan
+ include-$(CONFIG_KCOV)		+= scripts/Makefile.kcov
+ include-$(CONFIG_RANDSTRUCT)	+= scripts/Makefile.randstruct
+ include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
++include-$(CONFIG_CTF)		+= scripts/Makefile.ctfa-toplevel
+ 
+ include $(addprefix $(srctree)/, $(include-y))
+ 
+@@ -1151,7 +1152,11 @@ PHONY += vmlinux_o
+ vmlinux_o: vmlinux.a $(KBUILD_VMLINUX_LIBS)
+ 	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.vmlinux_o
+ 
+-vmlinux.o modules.builtin.modinfo modules.builtin: vmlinux_o
++MODULES_BUILTIN := modules.builtin.modinfo
++MODULES_BUILTIN += modules.builtin
++MODULES_BUILTIN += modules.builtin.objs
++
++vmlinux.o $(MODULES_BUILTIN): vmlinux_o
+ 	@:
+ 
+ PHONY += vmlinux
+@@ -1490,9 +1495,10 @@ endif # CONFIG_MODULES
+ 
+ # Directories & files removed with 'make clean'
+ CLEAN_FILES += vmlinux.symvers modules-only.symvers \
+-	       modules.builtin modules.builtin.modinfo modules.nsdeps \
++	       modules.builtin modules.builtin.* modules.nsdeps \
+ 	       compile_commands.json rust/test \
+-	       rust-project.json .vmlinux.objs .vmlinux.export.c
++	       rust-project.json .vmlinux.objs .vmlinux.export.c \
++	       vmlinux.ctfa
+ 
+ # Directories & files removed with 'make mrproper'
+ MRPROPER_FILES += include/config include/generated          \
+@@ -1586,6 +1592,8 @@ help:
+ 	@echo  '                    (requires a recent binutils and recent build (System.map))'
+ 	@echo  '  dir/file.ko     - Build module including final link'
+ 	@echo  '  modules_prepare - Set up for building external modules'
++	@echo  '  ctf             - Generate CTF type information, installed by make ctf_install'
++	@echo  '  ctf_install     - Install CTF to INSTALL_MOD_PATH (default: /)'
+ 	@echo  '  tags/TAGS	  - Generate tags file for editors'
+ 	@echo  '  cscope	  - Generate cscope index'
+ 	@echo  '  gtags           - Generate GNU GLOBAL index'
+@@ -1942,7 +1950,7 @@ clean: $(clean-dirs)
+ 	$(call cmd,rmfiles)
+ 	@find $(or $(KBUILD_EXTMOD), .) $(RCS_FIND_IGNORE) \
+ 		\( -name '*.[aios]' -o -name '*.rsi' -o -name '*.ko' -o -name '.*.cmd' \
+-		-o -name '*.ko.*' \
++		-o -name '*.ko.*' -o -name '*.ctf' \
+ 		-o -name '*.dtb' -o -name '*.dtbo' \
+ 		-o -name '*.dtb.S' -o -name '*.dtbo.S' \
+ 		-o -name '*.dt.yaml' -o -name 'dtbs-list' \
+diff --git a/arch/arm/vdso/Makefile b/arch/arm/vdso/Makefile
+index 01067a2bc43b7..d2193b8dfad83 100644
+--- a/arch/arm/vdso/Makefile
++++ b/arch/arm/vdso/Makefile
+@@ -14,6 +14,10 @@ obj-vdso := $(addprefix $(obj)/, $(obj-vdso))
+ ccflags-y := -fPIC -fno-common -fno-builtin -fno-stack-protector
+ ccflags-y += -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO32
+ 
++# CTF in the vDSO would introduce a new section, which would
++# expand the vDSO to more than a page.
++ccflags-y += $(call cc-option,-gctf0)
++
+ ldflags-$(CONFIG_CPU_ENDIAN_BE8) := --be8
+ ldflags-y := -Bsymbolic --no-undefined -soname=linux-vdso.so.1 \
+ 	    -z max-page-size=4096 -shared $(ldflags-y) \
+diff --git a/arch/arm64/kernel/vdso/Makefile b/arch/arm64/kernel/vdso/Makefile
+index d63930c828397..6e84d3822cfe3 100644
+--- a/arch/arm64/kernel/vdso/Makefile
++++ b/arch/arm64/kernel/vdso/Makefile
+@@ -33,6 +33,10 @@ ldflags-y += -T
+ ccflags-y := -fno-common -fno-builtin -fno-stack-protector -ffixed-x18
+ ccflags-y += -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
+ 
++# CTF in the vDSO would introduce a new section, which would
++# expand the vDSO to more than a page.
++ccflags-y += $(call cc-option,-gctf0)
++
+ # -Wmissing-prototypes and -Wmissing-declarations are removed from
+ # the CFLAGS of vgettimeofday.c to make possible to build the
+ # kernel with CONFIG_WERROR enabled.
+diff --git a/arch/loongarch/vdso/Makefile b/arch/loongarch/vdso/Makefile
+index d724d46b07c84..fbedb95223ae1 100644
+--- a/arch/loongarch/vdso/Makefile
++++ b/arch/loongarch/vdso/Makefile
+@@ -21,7 +21,8 @@ cflags-vdso := $(ccflags-vdso) \
+ 	-O2 -g -fno-strict-aliasing -fno-common -fno-builtin \
+ 	-fno-stack-protector -fno-jump-tables -DDISABLE_BRANCH_PROFILING \
+ 	$(call cc-option, -fno-asynchronous-unwind-tables) \
+-	$(call cc-option, -fno-stack-protector)
++	$(call cc-option, -fno-stack-protector) \
++	$(call cc-option,-gctf0)
+ aflags-vdso := $(ccflags-vdso) \
+ 	-D__ASSEMBLY__ -Wa,-gdwarf-2
+ 
+diff --git a/arch/mips/vdso/Makefile b/arch/mips/vdso/Makefile
+index b289b2c1b2946..6c8d777525f9b 100644
+--- a/arch/mips/vdso/Makefile
++++ b/arch/mips/vdso/Makefile
+@@ -30,7 +30,8 @@ cflags-vdso := $(ccflags-vdso) \
+ 	-O3 -g -fPIC -fno-strict-aliasing -fno-common -fno-builtin -G 0 \
+ 	-mrelax-pic-calls $(call cc-option, -mexplicit-relocs) \
+ 	-fno-stack-protector -fno-jump-tables -DDISABLE_BRANCH_PROFILING \
+-	$(call cc-option, -fno-asynchronous-unwind-tables)
++	$(call cc-option, -fno-asynchronous-unwind-tables) \
++	$(call cc-option,-gctf0)
+ aflags-vdso := $(ccflags-vdso) \
+ 	-D__ASSEMBLY__ -Wa,-gdwarf-2
+ 
+diff --git a/arch/sparc/vdso/Makefile b/arch/sparc/vdso/Makefile
+index 243dbfc4609d8..e4f3e47074e9d 100644
+--- a/arch/sparc/vdso/Makefile
++++ b/arch/sparc/vdso/Makefile
+@@ -44,7 +44,7 @@ $(obj)/vdso-image-%.c: $(obj)/vdso%.so.dbg $(obj)/vdso%.so $(obj)/vdso2c FORCE
+ CFL := $(PROFILING) -mcmodel=medlow -fPIC -O2 -fasynchronous-unwind-tables -m64 \
+        $(filter -g%,$(KBUILD_CFLAGS)) -fno-stack-protector \
+        -fno-omit-frame-pointer -foptimize-sibling-calls \
+-       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
++       $(call cc-option,-gctf0) -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
+ 
+ SPARC_REG_CFLAGS = -ffixed-g4 -ffixed-g5 -fcall-used-g5 -fcall-used-g7
+ 
+diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+index 215a1b202a918..2fa1613a06275 100644
+--- a/arch/x86/entry/vdso/Makefile
++++ b/arch/x86/entry/vdso/Makefile
+@@ -54,6 +54,7 @@ $(obj)/vdso-image-%.c: $(obj)/vdso%.so.dbg $(obj)/vdso%.so $(obj)/vdso2c FORCE
+ CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
+        $(filter -g%,$(KBUILD_CFLAGS)) -fno-stack-protector \
+        -fno-omit-frame-pointer -foptimize-sibling-calls \
++       $(call cc-option,-gctf0) \
+        -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
+ 
+ ifdef CONFIG_MITIGATION_RETPOLINE
+@@ -131,6 +132,7 @@ KBUILD_CFLAGS_32 += -m32 -msoft-float -mregparm=0 -fpic
+ KBUILD_CFLAGS_32 += -fno-stack-protector
+ KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
+ KBUILD_CFLAGS_32 += -fno-omit-frame-pointer
++KBUILD_CFLAGS_32 += $(call cc-option,-gctf0)
+ KBUILD_CFLAGS_32 += -DDISABLE_BRANCH_PROFILING
+ 
+ ifdef CONFIG_MITIGATION_RETPOLINE
+diff --git a/arch/x86/um/vdso/Makefile b/arch/x86/um/vdso/Makefile
+index 6a77ea6434ffd..6db233b5edd75 100644
+--- a/arch/x86/um/vdso/Makefile
++++ b/arch/x86/um/vdso/Makefile
+@@ -40,7 +40,7 @@ $(obj)/%.so: $(obj)/%.so.dbg FORCE
+ #
+ CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
+        $(filter -g%,$(KBUILD_CFLAGS)) -fno-stack-protector \
+-       -fno-omit-frame-pointer -foptimize-sibling-calls
++       -fno-omit-frame-pointer -foptimize-sibling-calls $(call cc-option,-gctf0)
+ 
+ $(vobjs): KBUILD_CFLAGS += $(CFL)
+ 
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index f00a8e18f389f..2e307c0824574 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -1014,6 +1014,7 @@
+ 	*(.discard.*)							\
+ 	*(.export_symbol)						\
+ 	*(.modinfo)							\
++	*(.ctf)								\
+ 	/* ld.bfd warns about .gnu.version* even when not emitted */	\
+ 	*(.gnu.version*)						\
+ 
+diff --git a/include/linux/module.h b/include/linux/module.h
+index 330ffb59efe51..2d9fcca542d13 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -180,7 +180,13 @@ extern void cleanup_module(void);
+ #ifdef MODULE
+ #define MODULE_FILE
+ #else
+-#define MODULE_FILE	MODULE_INFO(file, KBUILD_MODFILE);
++#ifdef CONFIG_CTF
++#define MODULE_FILE					                      \
++			MODULE_INFO(file, KBUILD_MODFILE);                    \
++			MODULE_INFO(objs, KBUILD_MODOBJS);
++#else
++#define MODULE_FILE MODULE_INFO(file, KBUILD_MODFILE);
++#endif
+ #endif
+ 
+ /*
+diff --git a/init/Kconfig b/init/Kconfig
+index 9684e5d2b81c6..c1b00b2e4a43d 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -111,6 +111,12 @@ config PAHOLE_VERSION
+ 	int
+ 	default $(shell,$(srctree)/scripts/pahole-version.sh $(PAHOLE))
+ 
++config HAVE_CTF_TOOLCHAIN
++	def_bool $(cc-option,-gctf) && $(ld-option,-lbfd -liberty -lctf -lbfd -liberty -lz -ldl -lc -o /dev/null)
++	depends on CC_IS_GCC
++	help
++	  GCC and binutils support CTF generation.
++
+ config CONSTRUCTORS
+ 	bool
+ 
+diff --git a/lib/Kconfig b/lib/Kconfig
+index b0a76dff5c182..61d0be30b3562 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -633,6 +633,16 @@ config DIMLIB
+ #
+ config LIBFDT
+ 	bool
++#
++# CTF support is select'ed if needed
++#
++config CTF
++        bool "Compact Type Format generation"
++        depends on HAVE_CTF_TOOLCHAIN
++        help
++          Emit a compact, compressed description of the kernel's datatypes and
++          global variables into the vmlinux.ctfa archive (for in-tree modules)
++          or into .ctf sections in kernel modules (for out-of-tree modules).
+ 
+ config OID_REGISTRY
+ 	tristate
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 59b6765d86b8f..dab7e6983eace 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -571,6 +571,21 @@ config VMLINUX_MAP
+ 	  pieces of code get eliminated with
+ 	  CONFIG_LD_DEAD_CODE_DATA_ELIMINATION.
+ 
++config BUILTIN_MODULE_RANGES
++	bool "Generate address range information for builtin modules"
++	depends on !LTO
++	depends on VMLINUX_MAP
++	help
++	 When modules are built into the kernel, there will be no module name
++	 associated with its symbols in /proc/kallsyms.  Tracers may want to
++	 identify symbols by module name and symbol name regardless of whether
++	 the module is configured as loadable or not.
++
++	 This option generates modules.builtin.ranges in the build tree with
++	 offset ranges (per ELF section) for the module(s) they belong to.
++	 It also records an anchor symbol to determine the load address of the
++	 section.
++
+ config DEBUG_FORCE_WEAK_PER_CPU
+ 	bool "Force weak per-cpu definitions"
+ 	depends on DEBUG_KERNEL
+diff --git a/scripts/.gitignore b/scripts/.gitignore
+index 3dbb8bb2457bc..11339fa922abd 100644
+--- a/scripts/.gitignore
++++ b/scripts/.gitignore
+@@ -11,3 +11,4 @@
+ /sorttable
+ /target.json
+ /unifdef
++y!/Makefile.ctf
+diff --git a/scripts/Makefile b/scripts/Makefile
+index fe56eeef09dd4..8e7eb174d3154 100644
+--- a/scripts/Makefile
++++ b/scripts/Makefile
+@@ -54,6 +54,7 @@ targets += module.lds
+ 
+ subdir-$(CONFIG_GCC_PLUGINS) += gcc-plugins
+ subdir-$(CONFIG_MODVERSIONS) += genksyms
++subdir-$(CONFIG_CTF)         += ctf
+ subdir-$(CONFIG_SECURITY_SELINUX) += selinux
+ 
+ # Let clean descend into subdirs
+diff --git a/scripts/Makefile.ctfa b/scripts/Makefile.ctfa
+new file mode 100644
+index 0000000000000..b65d9d391c29c
+--- /dev/null
++++ b/scripts/Makefile.ctfa
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# ===========================================================================
++# Module CTF/CTFA generation
++# ===========================================================================
++
++include include/config/auto.conf
++include $(srctree)/scripts/Kbuild.include
++
++# CTF is already present in every object file if CONFIG_CTF is enabled.
++# vmlinux.lds.h strips it out of the finished kernel, but if nothing is done
++# it will be deduplicated into module .ko's.  For out-of-tree module builds,
++# this is what we want, but for in-tree modules we can save substantial
++# space by deduplicating it against all the core kernel types as well.  So
++# split the CTF out of in-tree module .ko's into separate .ctf files so that
++# it doesn't take up space in the modules on disk, and let the specialized
++# ctfarchive tool consume it and all the CTF in the vmlinux.o files when
++# 'make ctf' is invoked, and use the same machinery that the linker uses to
++# do CTF deduplication to emit vmlinux.ctfa containing the deduplicated CTF.
++
++# Nothing special needs to be done if CTF is turned off or if a standalone
++# module is being built.
++module-ctf-postlink = mv $(1).tmp $(1)
++
++ifdef CONFIG_CTF
++
++# This is quite tricky.  The CTF machinery needs to be told about all the
++# built-in objects as well as all the external modules -- but Makefile.modfinal
++# only knows about the latter.  So the toplevel makefile emits the names of the
++# built-in objects into a temporary file, which is then catted and its contents
++# used as prerequisites by this rule.
++#
++# We write the names of the object files to be scanned for CTF content into a
++# file, then use that, to avoid hitting command-line length limits.
++
++ifeq ($(KBUILD_EXTMOD),)
++ctf-modules := $(shell find . -name '*.ko.ctf' -print)
++quiet_cmd_ctfa_raw = CTFARAW
++      cmd_ctfa_raw = scripts/ctf/ctfarchive $@ .tmp_objects.builtin modules.builtin.objs $(ctf-filelist)
++ctf-builtins := .tmp_objects.builtin
++ctf-filelist := .tmp_ctf.filelist
++ctf-filelist-raw := .tmp_ctf.filelist.raw
++
++define module-ctf-postlink =
++	$(OBJCOPY) --only-section=.ctf $(1).tmp $(1).ctf && \
++	$(OBJCOPY) --remove-section=.ctf $(1).tmp $(1) && rm -f $(1).tmp
++endef
++
++# Split a list up like shell xargs does.
++define xargs =
++$(1) $(wordlist 1,1024,$(2))
++$(if $(word 1025,$(2)),$(call xargs,$(1),$(wordlist 1025,$(words $(2)),$(2))))
++endef
++
++$(ctf-filelist-raw): $(ctf-builtins) $(ctf-modules)
++	@rm -f $(ctf-filelist-raw);
++	$(call xargs,@printf "%s\n" >> $(ctf-filelist-raw),$^)
++	@touch $(ctf-filelist-raw)
++
++$(ctf-filelist): $(ctf-filelist-raw)
++	@rm -f $(ctf-filelist);
++	@cat $(ctf-filelist-raw) | while read -r obj; do \
++		case $$obj in \
++		$(ctf-builtins)) cat $$obj >> $(ctf-filelist);; \
++		*.a) $(AR) t $$obj > $(ctf-filelist);; \
++		*.builtin) cat $$obj >> $(ctf-filelist);; \
++		*) echo "$$obj" >> $(ctf-filelist);; \
++		esac; \
++	done
++	@touch $(ctf-filelist)
++
++# The raw CTF depends on the output CTF file list, and that depends
++# on the .ko files for the modules.
++.tmp_vmlinux.ctfa.raw: $(ctf-filelist) FORCE
++	$(call if_changed,ctfa_raw)
++
++quiet_cmd_ctfa = CTFA
++      cmd_ctfa = { echo 'int main () { return 0; } ' | \
++		$(CC) -x c -c -o $<.stub -; \
++	$(OBJCOPY) '--remove-section=.*' --add-section=.ctf=$< \
++		 $<.stub $@; }
++
++# The CTF itself is an ELF executable with one section: the CTF.  This lets
++# objdump work on it, at minimal size cost.
++vmlinux.ctfa: .tmp_vmlinux.ctfa.raw FORCE
++	$(call if_changed,ctfa)
++
++targets += vmlinux.ctfa
++
++endif		# KBUILD_EXTMOD
++
++endif		# !CONFIG_CTF
++
+diff --git a/scripts/Makefile.ctfa-toplevel b/scripts/Makefile.ctfa-toplevel
+new file mode 100644
+index 0000000000000..210bef3854e9b
+--- /dev/null
++++ b/scripts/Makefile.ctfa-toplevel
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# ===========================================================================
++# CTF rules for the top-level makefile only
++# ===========================================================================
++
++KBUILD_CFLAGS	+= $(call cc-option,-gctf)
++KBUILD_LDFLAGS	+= $(call ld-option, --ctf-variables)
++
++ifeq ($(KBUILD_EXTMOD),)
++
++# CTF generation for in-tree code (modules, built-in and not, and core kernel)
++
++# This contains all the object files that are built directly into the
++# kernel (including built-in modules), for consumption by ctfarchive in
++# Makefile.modfinal.
++# This is made doubly annoying by the presence of '.o' files which are actually
++# thin ar archives, and the need to support file(1) versions too old to
++# recognize them as archives at all.  (So we assume that everything that is notr
++# an ELF object is an archive.)
++ifeq ($(SRCARCH),x86)
++.tmp_objects.builtin: $(vmlinux-dirs) $(if $(KBUILD_BUILTIN),bzImage) FORCE
++else
++ifeq ($(SRCARCH),arm64)
++.tmp_objects.builtin: $(vmlinux-dirs) $(if $(KBUILD_BUILTIN),Image) FORCE
++else
++.tmp_objects.builtin: $(vmlinux-dirs) $(if $(KBUILD_BUILTIN),vmlinux) FORCE
++endif
++endif
++	@echo $(KBUILD_VMLINUX_OBJS) | \
++		tr " " "\n" | grep "\.o$$" | xargs -r file | \
++		grep ELF | cut -d: -f1 > .tmp_objects.builtin
++	@for archive in $$(echo $(KBUILD_VMLINUX_OBJS) |\
++		tr " " "\n" | xargs -r file | grep -v ELF | cut -d: -f1); do \
++		$(AR) t "$$archive" >> .tmp_objects.builtin; \
++	done
++
++ctf: vmlinux.ctfa
++PHONY += ctf ctf_install
++
++# Making CTF needs the builtin files.  We need to force everything to be
++# built if not already done, since we need the .o files for the machinery
++# above to work.
++vmlinux.ctfa: KBUILD_BUILTIN := 1
++vmlinux.ctfa: modules.builtin.objs .tmp_objects.builtin
++	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.modfinal vmlinux.ctfa
++
++ctf_install:
++	$(Q)mkdir -p $(MODLIB)/kernel
++	@ln -sf $(abspath $(srctree)) $(MODLIB)/source
++	$(Q)cp -f $(objtree)/vmlinux.ctfa $(MODLIB)/kernel
++
++CLEAN_FILES += vmlinux.ctfa
++
++endif
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 7f8ec77bf35c9..8e67961ba2ec9 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -118,6 +118,8 @@ modname-multi = $(sort $(foreach m,$(multi-obj-ym),\
+ __modname = $(or $(modname-multi),$(basetarget))
+ 
+ modname = $(subst $(space),:,$(__modname))
++modname-objs = $($(modname)-objs) $($(modname)-y) $($(modname)-Y)
++modname-objs-prefixed = $(sort $(strip $(addprefix $(obj)/, $(modname-objs))))
+ modfile = $(addprefix $(obj)/,$(__modname))
+ 
+ # target with $(obj)/ and its suffix stripped
+@@ -133,6 +135,10 @@ modname_flags  = -DKBUILD_MODNAME=$(call name-fix,$(modname)) \
+ 		 -D__KBUILD_MODNAME=kmod_$(call name-fix-token,$(modname))
+ modfile_flags  = -DKBUILD_MODFILE=$(call stringify,$(modfile))
+ 
++ifdef CONFIG_CTF
++modfile_flags  += -DKBUILD_MODOBJS=$(call stringify,$(modfile).o:$(subst $(space),|,$(modname-objs-prefixed)))
++endif
++
+ _c_flags       = $(filter-out $(CFLAGS_REMOVE_$(target-stem).o), \
+                      $(filter-out $(ccflags-remove-y), \
+                          $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) $(ccflags-y)) \
+@@ -238,7 +244,7 @@ modkern_rustflags =                                              \
+ 
+ modkern_aflags = $(if $(part-of-module),				\
+ 			$(KBUILD_AFLAGS_MODULE) $(AFLAGS_MODULE),	\
+-			$(KBUILD_AFLAGS_KERNEL) $(AFLAGS_KERNEL))
++			$(KBUILD_AFLAGS_KERNEL) $(AFLAGS_KERNEL) $(modfile_flags))
+ 
+ c_flags        = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE)     \
+ 		 -include $(srctree)/include/linux/compiler_types.h       \
+@@ -248,7 +254,7 @@ c_flags        = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE)     \
+ rust_flags     = $(_rust_flags) $(modkern_rustflags) @$(objtree)/include/generated/rustc_cfg
+ 
+ a_flags        = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE)     \
+-		 $(_a_flags) $(modkern_aflags)
++		 $(_a_flags) $(modkern_aflags) $(modname_flags)
+ 
+ cpp_flags      = -Wp,-MMD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE)     \
+ 		 $(_cpp_flags)
+diff --git a/scripts/Makefile.modfinal b/scripts/Makefile.modfinal
+index 3bec9043e4f38..06807e403d162 100644
+--- a/scripts/Makefile.modfinal
++++ b/scripts/Makefile.modfinal
+@@ -30,11 +30,16 @@ quiet_cmd_cc_o_c = CC [M]  $@
+ %.mod.o: %.mod.c FORCE
+ 	$(call if_changed_dep,cc_o_c)
+ 
++# for module-ctf-postlink
++include $(srctree)/scripts/Makefile.ctfa
++
+ quiet_cmd_ld_ko_o = LD [M]  $@
+       cmd_ld_ko_o +=							\
+ 	$(LD) -r $(KBUILD_LDFLAGS)					\
+ 		$(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE)		\
+-		-T scripts/module.lds -o $@ $(filter %.o, $^)
++		-T scripts/module.lds $(LDFLAGS_$(modname)) -o $@.tmp	\
++		$(filter %.o, $^) &&					\
++	$(call module-ctf-postlink,$@)					\
+ 
+ quiet_cmd_btf_ko = BTF [M] $@
+       cmd_btf_ko = 							\
+diff --git a/scripts/Makefile.modinst b/scripts/Makefile.modinst
+index 0afd75472679f..e668469ce098c 100644
+--- a/scripts/Makefile.modinst
++++ b/scripts/Makefile.modinst
+@@ -30,10 +30,12 @@ $(MODLIB)/modules.order: modules.order FORCE
+ quiet_cmd_install_modorder = INSTALL $@
+       cmd_install_modorder = sed 's:^\(.*\)\.o$$:kernel/\1.ko:' $< > $@
+ 
+-# Install modules.builtin(.modinfo) even when CONFIG_MODULES is disabled.
+-install-y += $(addprefix $(MODLIB)/, modules.builtin modules.builtin.modinfo)
++# Install modules.builtin(.modinfo,.ranges,.objs) even when CONFIG_MODULES is disabled.
++install-y += $(addprefix $(MODLIB)/, modules.builtin modules.builtin.modinfo modules.builtin.objs)
+ 
+-$(addprefix $(MODLIB)/, modules.builtin modules.builtin.modinfo): $(MODLIB)/%: % FORCE
++install-$(CONFIG_BUILTIN_MODULE_RANGES) += $(MODLIB)/modules.builtin.ranges
++
++$(addprefix $(MODLIB)/, modules.builtin modules.builtin.modinfo modules.builtin.ranges modules.builtin.objs): $(MODLIB)/%: % FORCE
+ 	$(call cmd,install)
+ 
+ endif
+diff --git a/scripts/Makefile.vmlinux b/scripts/Makefile.vmlinux
+index 49946cb968440..7e8b703799c85 100644
+--- a/scripts/Makefile.vmlinux
++++ b/scripts/Makefile.vmlinux
+@@ -33,6 +33,24 @@ targets += vmlinux
+ vmlinux: scripts/link-vmlinux.sh vmlinux.o $(KBUILD_LDS) FORCE
+ 	+$(call if_changed_dep,link_vmlinux)
+ 
++# module.builtin.ranges
++# ---------------------------------------------------------------------------
++ifdef CONFIG_BUILTIN_MODULE_RANGES
++__default: modules.builtin.ranges
++
++quiet_cmd_modules_builtin_ranges = GEN     $@
++      cmd_modules_builtin_ranges = $(real-prereqs) > $@
++
++targets += modules.builtin.ranges
++modules.builtin.ranges: $(srctree)/scripts/generate_builtin_ranges.awk \
++			modules.builtin vmlinux.map vmlinux.o.map FORCE
++	$(call if_changed,modules_builtin_ranges)
++
++vmlinux.map: vmlinux
++	@:
++
++endif
++
+ # Add FORCE to the prequisites of a target to force it to be always rebuilt.
+ # ---------------------------------------------------------------------------
+ 
+diff --git a/scripts/Makefile.vmlinux_o b/scripts/Makefile.vmlinux_o
+index 6de297916ce68..86d6f8887313f 100644
+--- a/scripts/Makefile.vmlinux_o
++++ b/scripts/Makefile.vmlinux_o
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+ PHONY := __default
+-__default: vmlinux.o modules.builtin.modinfo modules.builtin
++__default: vmlinux.o modules.builtin.modinfo modules.builtin modules.builtin.objs
+ 
+ include include/config/auto.conf
+ include $(srctree)/scripts/Kbuild.include
+@@ -27,6 +27,18 @@ ifdef CONFIG_LTO_CLANG
+ initcalls-lds := .tmp_initcalls.lds
+ endif
+ 
++# Generate a linker script to delete CTF sections
++# -----------------------------------------------
++
++quiet_cmd_gen_remove_ctf.lds = GEN     $@
++      cmd_gen_remove_ctf.lds = \
++	$(LD) $(KBUILD_LDFLAGS) -r --verbose | awk -f $(real-prereqs) > $@
++
++.tmp_remove-ctf.lds: $(srctree)/scripts/remove-ctf-lds.awk FORCE
++	$(call if_changed,gen_remove_ctf.lds)
++
++targets := .tmp_remove-ctf.lds
++
+ # objtool for vmlinux.o
+ # ---------------------------------------------------------------------------
+ #
+@@ -42,13 +54,18 @@ vmlinux-objtool-args-$(CONFIG_NOINSTR_VALIDATION)	+= --noinstr \
+ 
+ objtool-args = $(vmlinux-objtool-args-y) --link
+ 
+-# Link of vmlinux.o used for section mismatch analysis
++# Link of vmlinux.o used for section mismatch analysis: we also strip the CTF
++# section out at this stage, since ctfarchive gets it from the underlying object
++# files and linking it further is a waste of time.
+ # ---------------------------------------------------------------------------
+ 
++vmlinux-o-ld-args-$(CONFIG_BUILTIN_MODULE_RANGES)	+= -Map=$@.map
++
+ quiet_cmd_ld_vmlinux.o = LD      $@
+       cmd_ld_vmlinux.o = \
+ 	$(LD) ${KBUILD_LDFLAGS} -r -o $@ \
+-	$(addprefix -T , $(initcalls-lds)) \
++	$(vmlinux-o-ld-args-y) \
++	$(addprefix -T , $(initcalls-lds)) -T .tmp_remove-ctf.lds \
+ 	--whole-archive vmlinux.a --no-whole-archive \
+ 	--start-group $(KBUILD_VMLINUX_LIBS) --end-group \
+ 	$(cmd_objtool)
+@@ -58,7 +75,7 @@ define rule_ld_vmlinux.o
+ 	$(call cmd,gen_objtooldep)
+ endef
+ 
+-vmlinux.o: $(initcalls-lds) vmlinux.a $(KBUILD_VMLINUX_LIBS) FORCE
++vmlinux.o: $(initcalls-lds) vmlinux.a $(KBUILD_VMLINUX_LIBS) .tmp_remove-ctf.lds FORCE
+ 	$(call if_changed_rule,ld_vmlinux.o)
+ 
+ targets += vmlinux.o
+@@ -87,6 +104,19 @@ targets += modules.builtin
+ modules.builtin: modules.builtin.modinfo FORCE
+ 	$(call if_changed,modules_builtin)
+ 
++# module.builtin.objs
++# ---------------------------------------------------------------------------
++quiet_cmd_modules_builtin_objs = GEN     $@
++      cmd_modules_builtin_objs = \
++	tr '\0' '\n' < $< | \
++	sed -n 's/^[[:alnum:]:_]*\.objs=//p' | \
++	tr ' ' '\n' | uniq | sed -e 's|:|: |' -e 's:|: :g' | \
++	tr -s ' ' > $@
++
++targets += modules.builtin.objs
++modules.builtin.objs: modules.builtin.modinfo FORCE
++	$(call if_changed,modules_builtin_objs)
++
+ # Add FORCE to the prequisites of a target to force it to be always rebuilt.
+ # ---------------------------------------------------------------------------
+ 
+diff --git a/scripts/ctf/.gitignore b/scripts/ctf/.gitignore
+new file mode 100644
+index 0000000000000..6a0eb1c3ceeab
+--- /dev/null
++++ b/scripts/ctf/.gitignore
+@@ -0,0 +1 @@
++ctfarchive
+diff --git a/scripts/ctf/Makefile b/scripts/ctf/Makefile
+new file mode 100644
+index 0000000000000..3b83f93bb9f9a
+--- /dev/null
++++ b/scripts/ctf/Makefile
+@@ -0,0 +1,5 @@
++ifdef CONFIG_CTF
++hostprogs-always-y	:= ctfarchive
++ctfarchive-objs		:= ctfarchive.o modules_builtin.o
++HOSTLDLIBS_ctfarchive := -lctf
++endif
+diff --git a/scripts/ctf/ctfarchive.c b/scripts/ctf/ctfarchive.c
+new file mode 100644
+index 0000000000000..92cc4912ed0ee
+--- /dev/null
++++ b/scripts/ctf/ctfarchive.c
+@@ -0,0 +1,413 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * ctfmerge.c: Read in CTF extracted from generated object files from a
++ * specified directory and generate a CTF archive whose members are the
++ * deduplicated CTF derived from those object files, split up by kernel
++ * module.
++ *
++ * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#define _GNU_SOURCE 1
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctf-api.h>
++#include "modules_builtin.h"
++
++static ctf_file_t *output;
++
++static int private_ctf_link_add_ctf(ctf_file_t *fp,
++				    const char *name)
++{
++#if !defined (CTF_LINK_FINAL)
++	return ctf_link_add_ctf(fp, NULL, name);
++#else
++	/* Non-upstreamed, erroneously-broken API.  */
++	return ctf_link_add_ctf(fp, NULL, name, NULL, 0);
++#endif
++}
++
++/*
++ * Add a file to the link.
++ */
++static void add_to_link(const char *fn)
++{
++	if (private_ctf_link_add_ctf(output, fn) < 0)
++	{
++		fprintf(stderr, "Cannot add CTF file %s: %s\n", fn,
++			ctf_errmsg(ctf_errno(output)));
++		exit(1);
++	}
++}
++
++struct from_to
++{
++	char *from;
++	char *to;
++};
++
++/*
++ * The world's stupidest hash table of FROM -> TO.
++ */
++static struct from_to **from_tos[256];
++static size_t alloc_from_tos[256];
++static size_t num_from_tos[256];
++
++static unsigned char from_to_hash(const char *from)
++{
++	unsigned char hval = 0;
++
++	const char *p;
++	for (p = from; *p; p++)
++		hval += *p;
++
++	return hval;
++}
++
++/*
++ * Note that we will need to add a CU mapping later on.
++ *
++ * Present purely to work around a binutils bug that stops
++ * ctf_link_add_cu_mapping() working right when called repeatedly
++ * with the same FROM.
++ */
++static int add_cu_mapping(const char *from, const char *to)
++{
++	ssize_t i, j;
++
++	i = from_to_hash(from);
++
++	for (j = 0; j < num_from_tos[i]; j++)
++		if (strcmp(from, from_tos[i][j]->from) == 0) {
++			char *tmp;
++
++			free(from_tos[i][j]->to);
++			tmp = strdup(to);
++			if (!tmp)
++				goto oom;
++			from_tos[i][j]->to = tmp;
++			return 0;
++		    }
++
++	if (num_from_tos[i] >= alloc_from_tos[i]) {
++		struct from_to **tmp;
++		if (alloc_from_tos[i] < 16)
++			alloc_from_tos[i] = 16;
++		else
++			alloc_from_tos[i] *= 2;
++
++		tmp = realloc(from_tos[i], alloc_from_tos[i] * sizeof(struct from_to *));
++		if (!tmp)
++			goto oom;
++
++		from_tos[i] = tmp;
++	}
++
++	j = num_from_tos[i];
++	from_tos[i][j] = malloc(sizeof(struct from_to));
++	if (from_tos[i][j] == NULL)
++		goto oom;
++	from_tos[i][j]->from = strdup(from);
++	from_tos[i][j]->to = strdup(to);
++	if (!from_tos[i][j]->from || !from_tos[i][j]->to)
++		goto oom;
++	num_from_tos[i]++;
++
++	return 0;
++  oom:
++	fprintf(stderr,
++		"out of memory in add_cu_mapping\n");
++	exit(1);
++}
++
++/*
++ * Finally tell binutils to add all the CU mappings, with duplicate FROMs
++ * replaced with the most recent one.
++ */
++static void commit_cu_mappings(void)
++{
++	ssize_t i, j;
++
++	for (i = 0; i < 256; i++)
++		for (j = 0; j < num_from_tos[i]; j++)
++			ctf_link_add_cu_mapping(output, from_tos[i][j]->from,
++						from_tos[i][j]->to);
++}
++
++/*
++ * Add a CU mapping to the link.
++ *
++ * CU mappings for built-in modules are added by suck_in_modules, below: here,
++ * we only want to add mappings for names ending in '.ko.ctf', i.e. external
++ * modules, which appear only in the filelist (since they are not built-in).
++ * The pathnames are stripped off because modules don't have any, and hyphens
++ * are translated into underscores.
++ */
++static void add_cu_mappings(const char *fn)
++{
++	const char *last_slash;
++	const char *modname = fn;
++	char *dynmodname = NULL;
++	char *dash;
++	size_t n;
++
++	last_slash = strrchr(modname, '/');
++	if (last_slash)
++		last_slash++;
++	else
++		last_slash = modname;
++	modname = last_slash;
++	if (strchr(modname, '-') != NULL)
++	{
++		dynmodname = strdup(last_slash);
++		dash = dynmodname;
++		while (dash != NULL) {
++			dash = strchr(dash, '-');
++			if (dash != NULL)
++				*dash = '_';
++		}
++		modname = dynmodname;
++	}
++
++	n = strlen(modname);
++	if (strcmp(modname + n - strlen(".ko.ctf"), ".ko.ctf") == 0) {
++		char *mod;
++
++		n -= strlen(".ko.ctf");
++		mod = strndup(modname, n);
++		add_cu_mapping(fn, mod);
++		free(mod);
++	}
++	free(dynmodname);
++}
++
++/*
++ * Add the passed names as mappings to "vmlinux".
++ */
++static void add_builtins(const char *fn)
++{
++	if (add_cu_mapping(fn, "vmlinux") < 0)
++	{
++		fprintf(stderr, "Cannot add CTF CU mapping from %s to \"vmlinux\"\n",
++			ctf_errmsg(ctf_errno(output)));
++		exit(1);
++	}
++}
++
++/*
++ * Do something with a file, line by line.
++ */
++static void suck_in_lines(const char *filename, void (*func)(const char *line))
++{
++	FILE *f;
++	char *line = NULL;
++	size_t line_size = 0;
++
++	f = fopen(filename, "r");
++	if (f == NULL) {
++		fprintf(stderr, "Cannot open %s: %s\n", filename,
++			strerror(errno));
++		exit(1);
++	}
++
++	while (getline(&line, &line_size, f) >= 0) {
++		size_t len = strlen(line);
++
++		if (len == 0)
++			continue;
++
++		if (line[len-1] == '\n')
++			line[len-1] = '\0';
++
++		func(line);
++	}
++	free(line);
++
++	if (ferror(f)) {
++		fprintf(stderr, "Error reading from %s: %s\n", filename,
++			strerror(errno));
++		exit(1);
++	}
++
++	fclose(f);
++}
++
++/*
++ * Pull in modules.builtin.objs and turn it into CU mappings.
++ */
++static void suck_in_modules(const char *modules_builtin_name)
++{
++	struct modules_builtin_iter *i;
++	char *module_name = NULL;
++	char **paths;
++
++	i = modules_builtin_iter_new(modules_builtin_name);
++	if (i == NULL) {
++		fprintf(stderr, "Cannot iterate over builtin module file.\n");
++		exit(1);
++	}
++
++	while ((paths = modules_builtin_iter_next(i, &module_name)) != NULL) {
++		size_t j;
++
++		for (j = 0; paths[j] != NULL; j++) {
++			char *alloc = NULL;
++			char *path = paths[j];
++			/*
++			 * If the name doesn't start in ./, add it, to match the names
++			 * passed to add_builtins.
++			 */
++			if (strncmp(paths[j], "./", 2) != 0) {
++				char *p;
++				if ((alloc = malloc(strlen(paths[j]) + 3)) == NULL) {
++					fprintf(stderr, "Cannot allocate memory for "
++						"builtin module object name %s.\n",
++						paths[j]);
++					exit(1);
++				}
++				p = alloc;
++				p = stpcpy(p, "./");
++				p = stpcpy(p, paths[j]);
++				path = alloc;
++			}
++			if (add_cu_mapping(path, module_name) < 0) {
++				fprintf(stderr, "Cannot add path -> module mapping for "
++					"%s -> %s: %s\n", path, module_name,
++					ctf_errmsg(ctf_errno(output)));
++				exit(1);
++			}
++			free (alloc);
++		}
++		free(paths);
++	}
++	free(module_name);
++	modules_builtin_iter_free(i);
++}
++
++/*
++ * Strip the leading .ctf. off all the module names: transform the default name
++ * from _CTF_SECTION into shared_ctf, and chop any trailing .ctf off (since that
++ * derives from the intermediate file used to keep the CTF out of the final
++ * module).
++ */
++static char *transform_module_names(ctf_file_t *fp __attribute__((__unused__)),
++				    const char *name,
++				    void *arg __attribute__((__unused__)))
++{
++	if (strcmp(name, ".ctf") == 0)
++		return strdup("shared_ctf");
++
++	if (strncmp(name, ".ctf", 4) == 0) {
++		size_t n = strlen (name);
++		if (strcmp(name + n - 4, ".ctf") == 0)
++			n -= 4;
++		return strndup(name + 4, n - 4);
++	}
++	return NULL;
++}
++
++int main(int argc, char *argv[])
++{
++	int err;
++	const char *output_file;
++	unsigned char *file_data = NULL;
++	size_t file_size;
++	FILE *fp;
++
++	if (argc != 5) {
++		fprintf(stderr, "Syntax: ctfarchive output-file objects.builtin modules.builtin\n");
++		fprintf(stderr, "                   filelist\n");
++		exit(1);
++	}
++
++	output_file = argv[1];
++
++	/*
++	 * First pull in the input files and add them to the link.
++	 */
++
++	output = ctf_create(&err);
++	if (!output) {
++		fprintf(stderr, "Cannot create output CTF archive: %s\n",
++			ctf_errmsg(err));
++		return 1;
++	}
++
++	suck_in_lines(argv[4], add_to_link);
++
++	/*
++	 * Make sure that, even if all their types are shared, all modules have
++	 * a ctf member that can be used as a child of the shared CTF.
++	 */
++	suck_in_lines(argv[4], add_cu_mappings);
++
++	/*
++	 * Then pull in the builtin objects list and add them as
++	 * mappings to "vmlinux".
++	 */
++
++	suck_in_lines(argv[2], add_builtins);
++
++	/*
++	 * Finally, pull in the object -> module mapping and add it
++	 * as appropriate mappings.
++	 */
++	suck_in_modules(argv[3]);
++
++	/*
++	 * Commit the added CU mappings.
++	 */
++	commit_cu_mappings();
++
++	/*
++	 * Arrange to fix up the module names.
++	 */
++	ctf_link_set_memb_name_changer(output, transform_module_names, NULL);
++
++	/*
++	 * Do the link.
++	 */
++	if (ctf_link(output, CTF_LINK_SHARE_DUPLICATED |
++                     CTF_LINK_EMPTY_CU_MAPPINGS) < 0)
++		goto ctf_err;
++
++	/*
++	 * Write the output.
++	 */
++
++	file_data = ctf_link_write(output, &file_size, 4096);
++	if (!file_data)
++		goto ctf_err;
++
++	fp = fopen(output_file, "w");
++	if (!fp)
++		goto err;
++
++	while ((err = fwrite(file_data, file_size, 1, fp)) == 0);
++	if (ferror(fp)) {
++		errno = ferror(fp);
++		goto err;
++	}
++	if (fclose(fp) < 0)
++		goto err;
++	free(file_data);
++	ctf_file_close(output);
++
++	return 0;
++err:
++	free(file_data);
++	fprintf(stderr, "Cannot create output CTF archive: %s\n",
++		strerror(errno));
++	return 1;
++ctf_err:
++	fprintf(stderr, "Cannot create output CTF archive: %s\n",
++		ctf_errmsg(ctf_errno(output)));
++	return 1;
++}
+diff --git a/scripts/ctf/modules_builtin.c b/scripts/ctf/modules_builtin.c
+new file mode 100644
+index 0000000000000..10af2bbc80e0c
+--- /dev/null
++++ b/scripts/ctf/modules_builtin.c
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include "../modules_builtin.c"
+diff --git a/scripts/ctf/modules_builtin.h b/scripts/ctf/modules_builtin.h
+new file mode 100644
+index 0000000000000..5e0299e5600c2
+--- /dev/null
++++ b/scripts/ctf/modules_builtin.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include "../modules_builtin.h"
+diff --git a/scripts/generate_builtin_ranges.awk b/scripts/generate_builtin_ranges.awk
+new file mode 100755
+index 0000000000000..51ae0458ffbdd
+--- /dev/null
++++ b/scripts/generate_builtin_ranges.awk
+@@ -0,0 +1,516 @@
++#!/usr/bin/gawk -f
++# SPDX-License-Identifier: GPL-2.0
++# generate_builtin_ranges.awk: Generate address range data for builtin modules
++# Written by Kris Van Hees <kris.van.hees@oracle.com>
++#
++# Usage: generate_builtin_ranges.awk modules.builtin vmlinux.map \
++#		vmlinux.o.map [ <build-dir> ] > modules.builtin.ranges
++#
++
++# Return the module name(s) (if any) associated with the given object.
++#
++# If we have seen this object before, return information from the cache.
++# Otherwise, retrieve it from the corresponding .cmd file.
++#
++function get_module_info(fn, mod, obj, s) {
++	if (fn in omod)
++		return omod[fn];
++
++	if (match(fn, /\/[^/]+$/) == 0)
++		return "";
++
++	obj = fn;
++	mod = "";
++	fn = kdir "/" substr(fn, 1, RSTART) "." substr(fn, RSTART + 1) ".cmd";
++	if (getline s <fn == 1) {
++		if (match(s, /DKBUILD_MODFILE=['"]+[^'"]+/) > 0) {
++			mod = substr(s, RSTART + 16, RLENGTH - 16);
++			gsub(/['"]/, "", mod);
++		} else if (match(s, /RUST_MODFILE=[^ ]+/) > 0)
++			mod = substr(s, RSTART + 13, RLENGTH - 13);
++	}
++	close(fn);
++
++	# A single module (common case) also reflects objects that are not part
++	# of a module.  Some of those objects have names that are also a module
++	# name (e.g. core).  We check the associated module file name, and if
++	# they do not match, the object is not part of a module.
++	if (mod !~ / /) {
++		if (!(mod in mods))
++			mod = "";
++	}
++
++	gsub(/([^/ ]*\/)+/, "", mod);
++	gsub(/-/, "_", mod);
++
++	# At this point, mod is a single (valid) module name, or a list of
++	# module names (that do not need validation).
++	omod[obj] = mod;
++
++	return mod;
++}
++
++# Update the ranges entry for the given module 'mod' in section 'osect'.
++#
++# We use a modified absolute start address (soff + base) as index because we
++# may need to insert an anchor record later that must be at the start of the
++# section data, and the first module may very well start at the same address.
++# So, we use (addr << 1) + 1 to allow a possible anchor record to be placed at
++# (addr << 1).  This is safe because the index is only used to sort the entries
++# before writing them out.
++#
++function update_entry(osect, mod, soff, eoff, sect, idx) {
++	sect = sect_in[osect];
++	idx = (soff + sect_base[osect]) * 2 + 1;
++	entries[idx] = sprintf("%s %08x-%08x %s", sect, soff, eoff, mod);
++	count[sect]++;
++}
++
++# Determine the kernel build directory to use (default is .).
++#
++BEGIN {
++	if (ARGC > 4) {
++		kdir = ARGV[ARGC - 1];
++		ARGV[ARGC - 1] = "";
++	} else
++		kdir = ".";
++}
++
++# (1) Build a lookup map of built-in module names.
++#
++# The first file argument is used as input (modules.builtin).
++#
++# Lines will be like:
++#	kernel/crypto/lzo-rle.ko
++# and we record the object name "crypto/lzo-rle".
++#
++ARGIND == 1 {
++	sub(/kernel\//, "");			# strip off "kernel/" prefix
++	sub(/\.ko$/, "");			# strip off .ko suffix
++
++	mods[$1] = 1;
++	next;
++}
++
++# (2) Collect address information for each section.
++#
++# The second file argument is used as input (vmlinux.map).
++#
++# We collect the base address of the section in order to convert all addresses
++# in the section into offset values.
++#
++# We collect the address of the anchor (or first symbol in the section if there
++# is no explicit anchor) to allow users of the range data to calculate address
++# ranges based on the actual load address of the section in the running kernel.
++#
++# We collect the start address of any sub-section (section included in the top
++# level section being processed).  This is needed when the final linking was
++# done using vmlinux.a because then the list of objects contained in each
++# section is to be obtained from vmlinux.o.map.  The offset of the sub-section
++# is recorded here, to be used as an addend when processing vmlinux.o.map
++# later.
++#
++
++# Both GNU ld and LLVM lld linker map format are supported by converting LLVM
++# lld linker map records into equivalent GNU ld linker map records.
++#
++# The first record of the vmlinux.map file provides enough information to know
++# which format we are dealing with.
++#
++ARGIND == 2 && FNR == 1 && NF == 7 && $1 == "VMA" && $7 == "Symbol" {
++	map_is_lld = 1;
++	if (dbg)
++		printf "NOTE: %s uses LLVM lld linker map format\n", FILENAME >"/dev/stderr";
++	next;
++}
++
++# (LLD) Convert a section record fronm lld format to ld format.
++#
++# lld: ffffffff82c00000          2c00000   2493c0  8192 .data
++#  ->
++# ld:  .data           0xffffffff82c00000   0x2493c0 load address 0x0000000002c00000
++#
++ARGIND == 2 && map_is_lld && NF == 5 && /[0-9] [^ ]+$/ {
++	$0 = $5 " 0x"$1 " 0x"$3 " load address 0x"$2;
++}
++
++# (LLD) Convert an anchor record from lld format to ld format.
++#
++# lld: ffffffff81000000          1000000        0     1         _text = .
++#  ->
++# ld:                  0xffffffff81000000                _text = .
++#
++ARGIND == 2 && map_is_lld && !anchor && NF == 7 && raw_addr == "0x"$1 && $6 == "=" && $7 == "." {
++	$0 = "  0x"$1 " " $5 " = .";
++}
++
++# (LLD) Convert an object record from lld format to ld format.
++#
++# lld:            11480            11480     1f07    16         vmlinux.a(arch/x86/events/amd/uncore.o):(.text)
++#  ->
++# ld:   .text          0x0000000000011480     0x1f07 arch/x86/events/amd/uncore.o
++#
++ARGIND == 2 && map_is_lld && NF == 5 && $5 ~ /:\(/ {
++	gsub(/\)/, "");
++	sub(/ vmlinux\.a\(/, " ");
++	sub(/:\(/, " ");
++	$0 = " "$6 " 0x"$1 " 0x"$3 " " $5;
++}
++
++# (LLD) Convert a symbol record from lld format to ld format.
++#
++# We only care about these while processing a section for which no anchor has
++# been determined yet.
++#
++# lld: ffffffff82a859a4          2a859a4        0     1                 btf_ksym_iter_id
++#  ->
++# ld:                  0xffffffff82a859a4                btf_ksym_iter_id
++#
++ARGIND == 2 && map_is_lld && sect && !anchor && NF == 5 && $5 ~ /^[_A-Za-z][_A-Za-z0-9]*$/ {
++	$0 = "  0x"$1 " " $5;
++}
++
++# (LLD) We do not need any other ldd linker map records.
++#
++ARGIND == 2 && map_is_lld && /^[0-9a-f]{16} / {
++	next;
++}
++
++# (LD) Section records with just the section name at the start of the line
++#      need to have the next line pulled in to determine whether it is a
++#      loadable section.  If it is, the next line will contains a hex value
++#      as first and second items.
++#
++ARGIND == 2 && !map_is_lld && NF == 1 && /^[^ ]/ {
++	s = $0;
++	getline;
++	if ($1 !~ /^0x/ || $2 !~ /^0x/)
++		next;
++
++	$0 = s " " $0;
++}
++
++# (LD) Object records with just the section name denote records with a long
++#      section name for which the remainder of the record can be found on the
++#      next line.
++#
++# (This is also needed for vmlinux.o.map, when used.)
++#
++ARGIND >= 2 && !map_is_lld && NF == 1 && /^ [^ \*]/ {
++	s = $0;
++	getline;
++	$0 = s " " $0;
++}
++
++# Beginning a new section - done with the previous one (if any).
++#
++ARGIND == 2 && /^[^ ]/ {
++	sect = 0;
++}
++
++# Process a loadable section (we only care about .-sections).
++#
++# Record the section name and its base address.
++# We also record the raw (non-stripped) address of the section because it can
++# be used to identify an anchor record.
++#
++# Note:
++# Since some AWK implementations cannot handle large integers, we strip off the
++# first 4 hex digits from the address.  This is safe because the kernel space
++# is not large enough for addresses to extend into those digits.  The portion
++# to strip off is stored in addr_prefix as a regexp, so further clauses can
++# perform a simple substitution to do the address stripping.
++#
++ARGIND == 2 && /^\./ {
++	# Explicitly ignore a few sections that are not relevant here.
++	if ($1 ~ /^\.orc_/ || $1 ~ /_sites$/ || $1 ~ /\.percpu/)
++		next;
++
++	# Sections with a 0-address can be ignored as well.
++	if ($2 ~ /^0x0+$/)
++		next;
++
++	raw_addr = $2;
++	addr_prefix = "^" substr($2, 1, 6);
++	base = $2;
++	sub(addr_prefix, "0x", base);
++	base = strtonum(base);
++	sect = $1;
++	anchor = 0;
++	sect_base[sect] = base;
++	sect_size[sect] = strtonum($3);
++
++	if (dbg)
++		printf "[%s] BASE   %016x\n", sect, base >"/dev/stderr";
++
++	next;
++}
++
++# If we are not in a section we care about, we ignore the record.
++#
++ARGIND == 2 && !sect {
++	next;
++}
++
++# Record the first anchor symbol for the current section.
++#
++# An anchor record for the section bears the same raw address as the section
++# record.
++#
++ARGIND == 2 && !anchor && NF == 4 && raw_addr == $1 && $3 == "=" && $4 == "." {
++	anchor = sprintf("%s %08x-%08x = %s", sect, 0, 0, $2);
++	sect_anchor[sect] = anchor;
++
++	if (dbg)
++		printf "[%s] ANCHOR %016x = %s (.)\n", sect, 0, $2 >"/dev/stderr";
++
++	next;
++}
++
++# If no anchor record was found for the current section, use the first symbol
++# in the section as anchor.
++#
++ARGIND == 2 && !anchor && NF == 2 && $1 ~ /^0x/ && $2 !~ /^0x/ {
++	addr = $1;
++	sub(addr_prefix, "0x", addr);
++	addr = strtonum(addr) - base;
++	anchor = sprintf("%s %08x-%08x = %s", sect, addr, addr, $2);
++	sect_anchor[sect] = anchor;
++
++	if (dbg)
++		printf "[%s] ANCHOR %016x = %s\n", sect, addr, $2 >"/dev/stderr";
++
++	next;
++}
++
++# The first occurrence of a section name in an object record establishes the
++# addend (often 0) for that section.  This information is needed to handle
++# sections that get combined in the final linking of vmlinux (e.g. .head.text
++# getting included at the start of .text).
++#
++# If the section does not have a base yet, use the base of the encapsulating
++# section.
++#
++ARGIND == 2 && sect && NF == 4 && /^ [^ \*]/ && !($1 in sect_addend) {
++	if (!($1 in sect_base)) {
++		sect_base[$1] = base;
++
++		if (dbg)
++			printf "[%s] BASE   %016x\n", $1, base >"/dev/stderr";
++	}
++
++	addr = $2;
++	sub(addr_prefix, "0x", addr);
++	addr = strtonum(addr);
++	sect_addend[$1] = addr - sect_base[$1];
++	sect_in[$1] = sect;
++
++	if (dbg)
++		printf "[%s] ADDEND %016x - %016x = %016x\n",  $1, addr, base, sect_addend[$1] >"/dev/stderr";
++
++	# If the object is vmlinux.o then we will need vmlinux.o.map to get the
++	# actual offsets of objects.
++	if ($4 == "vmlinux.o")
++		need_o_map = 1;
++}
++
++# (3) Collect offset ranges (relative to the section base address) for built-in
++# modules.
++#
++# If the final link was done using the actual objects, vmlinux.map contains all
++# the information we need (see section (3a)).
++# If linking was done using vmlinux.a as intermediary, we will need to process
++# vmlinux.o.map (see section (3b)).
++
++# (3a) Determine offset range info using vmlinux.map.
++#
++# Since we are already processing vmlinux.map, the top level section that is
++# being processed is already known.  If we do not have a base address for it,
++# we do not need to process records for it.
++#
++# Given the object name, we determine the module(s) (if any) that the current
++# object is associated with.
++#
++# If we were already processing objects for a (list of) module(s):
++#  - If the current object belongs to the same module(s), update the range data
++#    to include the current object.
++#  - Otherwise, ensure that the end offset of the range is valid.
++#
++# If the current object does not belong to a built-in module, ignore it.
++#
++# If it does, we add a new built-in module offset range record.
++#
++ARGIND == 2 && !need_o_map && /^ [^ ]/ && NF == 4 && $3 != "0x0" {
++	if (!(sect in sect_base))
++		next;
++
++	# Turn the address into an offset from the section base.
++	soff = $2;
++	sub(addr_prefix, "0x", soff);
++	soff = strtonum(soff) - sect_base[sect];
++	eoff = soff + strtonum($3);
++
++	# Determine which (if any) built-in modules the object belongs to.
++	mod = get_module_info($4);
++
++	# If we are processing a built-in module:
++	#   - If the current object is within the same module, we update its
++	#     entry by extending the range and move on
++	#   - Otherwise:
++	#       + If we are still processing within the same main section, we
++	#         validate the end offset against the start offset of the
++	#         current object (e.g. .rodata.str1.[18] objects are often
++	#         listed with an incorrect size in the linker map)
++	#       + Otherwise, we validate the end offset against the section
++	#         size
++	if (mod_name) {
++		if (mod == mod_name) {
++			mod_eoff = eoff;
++			update_entry(mod_sect, mod_name, mod_soff, eoff);
++
++			next;
++		} else if (sect == sect_in[mod_sect]) {
++			if (mod_eoff > soff)
++				update_entry(mod_sect, mod_name, mod_soff, soff);
++		} else {
++			v = sect_size[sect_in[mod_sect]];
++			if (mod_eoff > v)
++				update_entry(mod_sect, mod_name, mod_soff, v);
++		}
++	}
++
++	mod_name = mod;
++
++	# If we encountered an object that is not part of a built-in module, we
++	# do not need to record any data.
++	if (!mod)
++		next;
++
++	# At this point, we encountered the start of a new built-in module.
++	mod_name = mod;
++	mod_soff = soff;
++	mod_eoff = eoff;
++	mod_sect = $1;
++	update_entry($1, mod, soff, mod_eoff);
++
++	next;
++}
++
++# If we do not need to parse the vmlinux.o.map file, we are done.
++#
++ARGIND == 3 && !need_o_map {
++	if (dbg)
++		printf "Note: %s is not needed.\n", FILENAME >"/dev/stderr";
++	exit;
++}
++
++# (3) Collect offset ranges (relative to the section base address) for built-in
++# modules.
++#
++
++# (LLD) Convert an object record from lld format to ld format.
++#
++ARGIND == 3 && map_is_lld && NF == 5 && $5 ~ /:\(/ {
++	gsub(/\)/, "");
++	sub(/:\(/, " ");
++
++	sect = $6;
++	if (!(sect in sect_addend))
++		next;
++
++	sub(/ vmlinux\.a\(/, " ");
++	$0 = " "sect " 0x"$1 " 0x"$3 " " $5;
++}
++
++# (3b) Determine offset range info using vmlinux.o.map.
++#
++# If we do not know an addend for the object's section, we are interested in
++# anything within that section.
++#
++# Determine the top-level section that the object's section was included in
++# during the final link.  This is the section name offset range data will be
++# associated with for this object.
++#
++# The remainder of the processing of the current object record follows the
++# procedure outlined in (3a).
++#
++ARGIND == 3 && /^ [^ ]/ && NF == 4 && $3 != "0x0" {
++	osect = $1;
++	if (!(osect in sect_addend))
++		next;
++
++	# We need to work with the main section.
++	sect = sect_in[osect];
++
++	# Turn the address into an offset from the section base.
++	soff = $2;
++	sub(addr_prefix, "0x", soff);
++	soff = strtonum(soff) + sect_addend[osect];
++	eoff = soff + strtonum($3);
++
++	# Determine which (if any) built-in modules the object belongs to.
++	mod = get_module_info($4);
++
++	# If we are processing a built-in module:
++	#   - If the current object is within the same module, we update its
++	#     entry by extending the range and move on
++	#   - Otherwise:
++	#       + If we are still processing within the same main section, we
++	#         validate the end offset against the start offset of the
++	#         current object (e.g. .rodata.str1.[18] objects are often
++	#         listed with an incorrect size in the linker map)
++	#       + Otherwise, we validate the end offset against the section
++	#         size
++	if (mod_name) {
++		if (mod == mod_name) {
++			mod_eoff = eoff;
++			update_entry(mod_sect, mod_name, mod_soff, eoff);
++
++			next;
++		} else if (sect == sect_in[mod_sect]) {
++			if (mod_eoff > soff)
++				update_entry(mod_sect, mod_name, mod_soff, soff);
++		} else {
++			v = sect_size[sect_in[mod_sect]];
++			if (mod_eoff > v)
++				update_entry(mod_sect, mod_name, mod_soff, v);
++		}
++	}
++
++	mod_name = mod;
++
++	# If we encountered an object that is not part of a built-in module, we
++	# do not need to record any data.
++	if (!mod)
++		next;
++
++	# At this point, we encountered the start of a new built-in module.
++	mod_name = mod;
++	mod_soff = soff;
++	mod_eoff = eoff;
++	mod_sect = osect;
++	update_entry(osect, mod, soff, mod_eoff);
++
++	next;
++}
++
++# (4) Generate the output.
++#
++# Anchor records are added for each section that contains offset range data
++# records.  They are added at an adjusted section base address (base << 1) to
++# ensure they come first in the second records (see update_entry() above for
++# more information).
++#
++# All entries are sorted by (adjusted) address to ensure that the output can be
++# parsed in strict ascending address order.
++#
++END {
++	for (sect in count) {
++		if (sect in sect_anchor)
++			entries[sect_base[sect] * 2] = sect_anchor[sect];
++	}
++
++	n = asorti(entries, indices);
++	for (i = 1; i <= n; i++)
++		print entries[indices[i]];
++}
+diff --git a/scripts/mod/modpost.c b/scripts/mod/modpost.c
+index f48d72d22dc2a..d7e6cd7781256 100644
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -733,6 +733,7 @@ static const char *const section_white_list[] =
+ 	".comment*",
+ 	".debug*",
+ 	".zdebug*",		/* Compressed debug sections. */
++        ".ctf",			/* Type info */
+ 	".GCC.command.line",	/* record-gcc-switches */
+ 	".mdebug*",        /* alpha, score, mips etc. */
+ 	".pdr",            /* alpha, score, mips etc. */
+diff --git a/scripts/modules_builtin.c b/scripts/modules_builtin.c
+new file mode 100644
+index 0000000000000..df52932a4417b
+--- /dev/null
++++ b/scripts/modules_builtin.c
+@@ -0,0 +1,200 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * A simple modules_builtin reader.
++ *
++ * (C) 2014, 2022 Oracle, Inc.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "modules_builtin.h"
++
++/*
++ * Read a modules.builtin.objs file and translate it into a stream of
++ * name / module-name pairs.
++ */
++
++/*
++ * Construct a modules.builtin.objs iterator.
++ */
++struct modules_builtin_iter *
++modules_builtin_iter_new(const char *modules_builtin_file)
++{
++	struct modules_builtin_iter *i;
++
++	i = calloc(1, sizeof(struct modules_builtin_iter));
++	if (i == NULL)
++		return NULL;
++
++	i->f = fopen(modules_builtin_file, "r");
++
++	if (i->f == NULL) {
++		fprintf(stderr, "Cannot open builtin module file %s: %s\n",
++			modules_builtin_file, strerror(errno));
++		return NULL;
++	}
++
++	return i;
++}
++
++/*
++ * Iterate, returning a new null-terminated array of object file names, and a
++ * new dynamically-allocated module name.  (The module name passed in is freed.)
++ *
++ * The array of object file names should be freed by the caller: the strings it
++ * points to are owned by the iterator, and should not be freed.
++ */
++
++char ** __attribute__((__nonnull__))
++modules_builtin_iter_next(struct modules_builtin_iter *i, char **module_name)
++{
++	size_t npaths = 1;
++	char **module_paths;
++	char *last_slash;
++	char *last_dot;
++	char *trailing_linefeed;
++	char *object_name = i->line;
++	char *dash;
++	int composite = 0;
++
++	/*
++	 * Read in all module entries, computing the suffixless, pathless name
++	 * of the module and building the next arrayful of object file names for
++	 * return.
++	 *
++	 * Modules can consist of multiple files: in this case, the portion
++	 * before the colon is the path to the module (as before): the portion
++	 * after the colon is a space-separated list of files that should be
++	 * considered part of this module.  In this case, the portion before the
++	 * name is an "object file" that does not actually exist: it is merged
++	 * into built-in.a without ever being written out.
++	 *
++	 * All module names have - translated to _, to match what is done to the
++	 * names of the same things when built as modules.
++	 */
++
++	/*
++	 * Reinvocation of exhausted iterator. Return NULL, once.
++	 */
++retry:
++	if (getline(&i->line, &i->line_size, i->f) < 0) {
++		if (ferror(i->f)) {
++			fprintf(stderr, "Error reading from modules_builtin file:"
++				" %s\n", strerror(errno));
++			exit(1);
++		}
++		rewind(i->f);
++		return NULL;
++	}
++
++	if (i->line[0] == '\0')
++		goto retry;
++
++	trailing_linefeed = strchr(i->line, '\n');
++	if (trailing_linefeed != NULL)
++		*trailing_linefeed = '\0';
++
++	/*
++	 * Slice the line in two at the colon, if any.  If there is anything
++	 * past the ': ', this is a composite module.  (We allow for no colon
++	 * for robustness, even though one should always be present.)
++	 */
++	if (strchr(i->line, ':') != NULL) {
++		char *name_start;
++
++		object_name = strchr(i->line, ':');
++		*object_name = '\0';
++		object_name++;
++		name_start = object_name + strspn(object_name, " \n");
++		if (*name_start != '\0') {
++			composite = 1;
++			object_name = name_start;
++		}
++	}
++
++	/*
++	 * Figure out the module name.
++	 */
++	last_slash = strrchr(i->line, '/');
++	last_slash = (!last_slash) ? i->line :
++		last_slash + 1;
++	free(*module_name);
++	*module_name = strdup(last_slash);
++	dash = *module_name;
++
++	while (dash != NULL) {
++		dash = strchr(dash, '-');
++		if (dash != NULL)
++			*dash = '_';
++	}
++
++	last_dot = strrchr(*module_name, '.');
++	if (last_dot != NULL)
++		*last_dot = '\0';
++
++	/*
++	 * Multifile separator? Object file names explicitly stated:
++	 * slice them up and shuffle them in.
++	 *
++	 * The array size may be an overestimate if any object file
++	 * names start or end with spaces (very unlikely) but cannot be
++	 * an underestimate.  (Check for it anyway.)
++	 */
++	if (composite) {
++		char *one_object;
++
++		for (npaths = 0, one_object = object_name;
++		     one_object != NULL;
++		     npaths++, one_object = strchr(one_object + 1, ' '));
++	}
++
++	module_paths = malloc((npaths + 1) * sizeof(char *));
++	if (!module_paths) {
++		fprintf(stderr, "%s: out of memory on module %s\n", __func__,
++			*module_name);
++		exit(1);
++	}
++
++	if (composite) {
++		char *one_object;
++		size_t i = 0;
++
++		while ((one_object = strsep(&object_name, " ")) != NULL) {
++			if (i >= npaths) {
++				fprintf(stderr, "%s: num_objs overflow on module "
++					"%s: this is a bug.\n", __func__,
++					*module_name);
++				exit(1);
++			}
++
++			module_paths[i++] = one_object;
++		}
++	} else
++		module_paths[0] = i->line;	/* untransformed module name */
++
++	module_paths[npaths] = NULL;
++
++	return module_paths;
++}
++
++/*
++ * Free an iterator. Can be called while iteration is underway, so even
++ * state that is freed at the end of iteration must be freed here too.
++ */
++void
++modules_builtin_iter_free(struct modules_builtin_iter *i)
++{
++	if (i == NULL)
++		return;
++	fclose(i->f);
++	free(i->line);
++	free(i);
++}
+diff --git a/scripts/modules_builtin.h b/scripts/modules_builtin.h
+new file mode 100644
+index 0000000000000..5138792b42ef0
+--- /dev/null
++++ b/scripts/modules_builtin.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * A simple modules.builtin.objs reader.
++ *
++ * (C) 2014, 2022 Oracle, Inc.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef _LINUX_MODULES_BUILTIN_H
++#define _LINUX_MODULES_BUILTIN_H
++
++#include <stdio.h>
++#include <stddef.h>
++
++/*
++ * modules.builtin.objs iteration state.
++ */
++struct modules_builtin_iter {
++	FILE *f;
++	char *line;
++	size_t line_size;
++};
++
++/*
++ * Construct a modules_builtin.objs iterator.
++ */
++struct modules_builtin_iter *
++modules_builtin_iter_new(const char *modules_builtin_file);
++
++/*
++ * Iterate, returning a new null-terminated array of object file names, and a
++ * new dynamically-allocated module name.  (The module name passed in is freed.)
++ *
++ * The array of object file names should be freed by the caller: the strings it
++ * points to are owned by the iterator, and should not be freed.
++ */
++
++char ** __attribute__((__nonnull__))
++modules_builtin_iter_next(struct modules_builtin_iter *i, char **module_name);
++
++void
++modules_builtin_iter_free(struct modules_builtin_iter *i);
++
++#endif
+diff --git a/scripts/package/kernel.spec b/scripts/package/kernel.spec
+index c52d517b93647..8f75906a96314 100644
+--- a/scripts/package/kernel.spec
++++ b/scripts/package/kernel.spec
+@@ -53,12 +53,18 @@ patch -p1 < %{SOURCE2}
+ 
+ %build
+ %{make} %{makeflags} KERNELRELEASE=%{KERNELRELEASE} KBUILD_BUILD_VERSION=%{release}
++%if %{with_ctf}
++%{make} %{makeflags} KERNELRELEASE=%{KERNELRELEASE} KBUILD_BUILD_VERSION=%{release} ctf
++%endif
+ 
+ %install
+ mkdir -p %{buildroot}/lib/modules/%{KERNELRELEASE}
+ cp $(%{make} %{makeflags} -s image_name) %{buildroot}/lib/modules/%{KERNELRELEASE}/vmlinuz
+ # DEPMOD=true makes depmod no-op. We do not package depmod-generated files.
+ %{make} %{makeflags} INSTALL_MOD_PATH=%{buildroot} DEPMOD=true modules_install
++%if %{with_ctf}
++%{make} %{makeflags} INSTALL_MOD_PATH=%{buildroot} ctf_install
++%endif
+ %{make} %{makeflags} INSTALL_HDR_PATH=%{buildroot}/usr headers_install
+ cp System.map %{buildroot}/lib/modules/%{KERNELRELEASE}
+ cp .config %{buildroot}/lib/modules/%{KERNELRELEASE}/config
+diff --git a/scripts/package/mkspec b/scripts/package/mkspec
+index ce201bfa8377c..aeb43c7ab1229 100755
+--- a/scripts/package/mkspec
++++ b/scripts/package/mkspec
+@@ -21,10 +21,16 @@ else
+ echo '%define with_devel 0'
+ fi
+ 
++if grep -q CONFIG_CTF=y include/config/auto.conf; then
++echo '%define with_ctf %{?_without_ctf: 0} %{?!_without_ctf: 1}'
++else
++echo '%define with_ctf 0'
++fi
+ cat<<EOF
+ %define ARCH ${ARCH}
+ %define KERNELRELEASE ${KERNELRELEASE}
+ %define pkg_release $("${srctree}/init/build-version")
++
+ EOF
+ 
+ cat "${srctree}/scripts/package/kernel.spec"
+diff --git a/scripts/remove-ctf-lds.awk b/scripts/remove-ctf-lds.awk
+new file mode 100644
+index 0000000000000..5d94d6ee99227
+--- /dev/null
++++ b/scripts/remove-ctf-lds.awk
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0
++# See Makefile.vmlinux_o
++
++BEGIN {
++    discards = 0; p = 0
++}
++
++/^====/ { p = 1; next; }
++p && /\.ctf/ { next; }
++p && !discards && /DISCARD/ { sub(/\} *$/, " *(.ctf) }"); discards = 1 }
++p && /^\}/ && !discards { print "  /DISCARD/ : { *(.ctf) }"; }
++p { print $0; }
+diff --git a/scripts/verify_builtin_ranges.awk b/scripts/verify_builtin_ranges.awk
+new file mode 100755
+index 0000000000000..f513841da83e1
+--- /dev/null
++++ b/scripts/verify_builtin_ranges.awk
+@@ -0,0 +1,356 @@
++#!/usr/bin/gawk -f
++# SPDX-License-Identifier: GPL-2.0
++# verify_builtin_ranges.awk: Verify address range data for builtin modules
++# Written by Kris Van Hees <kris.van.hees@oracle.com>
++#
++# Usage: verify_builtin_ranges.awk modules.builtin.ranges System.map \
++#				   modules.builtin vmlinux.map vmlinux.o.map \
++#				   [ <build-dir> ]
++#
++
++# Return the module name(s) (if any) associated with the given object.
++#
++# If we have seen this object before, return information from the cache.
++# Otherwise, retrieve it from the corresponding .cmd file.
++#
++function get_module_info(fn, mod, obj, s) {
++	if (fn in omod)
++		return omod[fn];
++
++	if (match(fn, /\/[^/]+$/) == 0)
++		return "";
++
++	obj = fn;
++	mod = "";
++	fn = kdir "/" substr(fn, 1, RSTART) "." substr(fn, RSTART + 1) ".cmd";
++	if (getline s <fn == 1) {
++		if (match(s, /DKBUILD_MODFILE=['"]+[^'"]+/) > 0) {
++			mod = substr(s, RSTART + 16, RLENGTH - 16);
++			gsub(/['"]/, "", mod);
++		} else if (match(s, /RUST_MODFILE=[^ ]+/) > 0)
++			mod = substr(s, RSTART + 13, RLENGTH - 13);
++	} else {
++		print "ERROR: Failed to read: " fn "\n\n" \
++		      "  Invalid kernel build directory (" kdir ")\n" \
++		      "  or its content does not match " ARGV[1] >"/dev/stderr";
++		close(fn);
++		total = 0;
++		exit(1);
++	}
++	close(fn);
++
++	# A single module (common case) also reflects objects that are not part
++	# of a module.  Some of those objects have names that are also a module
++	# name (e.g. core).  We check the associated module file name, and if
++	# they do not match, the object is not part of a module.
++	if (mod !~ / /) {
++		if (!(mod in mods))
++			mod = "";
++	}
++
++	gsub(/([^/ ]*\/)+/, "", mod);
++	gsub(/-/, "_", mod);
++
++	# At this point, mod is a single (valid) module name, or a list of
++	# module names (that do not need validation).
++	omod[obj] = mod;
++
++	return mod;
++}
++
++# Return a representative integer value for a given hexadecimal address.
++#
++# Since all kernel addresses fall within the same memory region, we can safely
++# strip off the first 6 hex digits before performing the hex-to-dec conversion,
++# thereby avoiding integer overflows.
++#
++function addr2val(val) {
++	sub(/^0x/, "", val);
++	if (length(val) == 16)
++		val = substr(val, 5);
++	return strtonum("0x" val);
++}
++
++# Determine the kernel build directory to use (default is .).
++#
++BEGIN {
++	if (ARGC > 6) {
++		kdir = ARGV[ARGC - 1];
++		ARGV[ARGC - 1] = "";
++	} else
++		kdir = ".";
++}
++
++# (1) Load the built-in module address range data.
++#
++ARGIND == 1 {
++	ranges[FNR] = $0;
++	rcnt++;
++	next;
++}
++
++# (2) Annotate System.map symbols with module names.
++#
++ARGIND == 2 {
++	addr = addr2val($1);
++	name = $3;
++
++	while (addr >= mod_eaddr) {
++		if (sect_symb) {
++			if (sect_symb != name)
++				next;
++
++			sect_base = addr - sect_off;
++			if (dbg)
++				printf "[%s] BASE (%s) %016x - %016x = %016x\n", sect_name, sect_symb, addr, sect_off, sect_base >"/dev/stderr";
++			sect_symb = 0;
++		}
++
++		if (++ridx > rcnt)
++			break;
++
++		$0 = ranges[ridx];
++		sub(/-/, " ");
++		if ($4 != "=") {
++			sub(/-/, " ");
++			mod_saddr = strtonum("0x" $2) + sect_base;
++			mod_eaddr = strtonum("0x" $3) + sect_base;
++			$1 = $2 = $3 = "";
++			sub(/^ +/, "");
++			mod_name = $0;
++
++			if (dbg)
++				printf "[%s] %s from %016x to %016x\n", sect_name, mod_name, mod_saddr, mod_eaddr >"/dev/stderr";
++		} else {
++			sect_name = $1;
++			sect_off = strtonum("0x" $2);
++			sect_symb = $5;
++		}
++	}
++
++	idx = addr"-"name;
++	if (addr >= mod_saddr && addr < mod_eaddr)
++		sym2mod[idx] = mod_name;
++
++	next;
++}
++
++# Once we are done annotating the System.map, we no longer need the ranges data.
++#
++FNR == 1 && ARGIND == 3 {
++	delete ranges;
++}
++
++# (3) Build a lookup map of built-in module names.
++#
++# Lines from modules.builtin will be like:
++#	kernel/crypto/lzo-rle.ko
++# and we record the object name "crypto/lzo-rle".
++#
++ARGIND == 3 {
++	sub(/kernel\//, "");			# strip off "kernel/" prefix
++	sub(/\.ko$/, "");			# strip off .ko suffix
++
++	mods[$1] = 1;
++	next;
++}
++
++# (4) Get a list of symbols (per object).
++#
++# Symbols by object are read from vmlinux.map, with fallback to vmlinux.o.map
++# if vmlinux is found to have inked in vmlinux.o.
++#
++
++# If we were able to get the data we need from vmlinux.map, there is no need to
++# process vmlinux.o.map.
++#
++FNR == 1 && ARGIND == 5 && total > 0 {
++	if (dbg)
++		printf "Note: %s is not needed.\n", FILENAME >"/dev/stderr";
++	exit;
++}
++
++# First determine whether we are dealing with a GNU ld or LLVM lld linker map.
++#
++ARGIND >= 4 && FNR == 1 && NF == 7 && $1 == "VMA" && $7 == "Symbol" {
++	map_is_lld = 1;
++	next;
++}
++
++# (LLD) Convert a section record fronm lld format to ld format.
++#
++ARGIND >= 4 && map_is_lld && NF == 5 && /[0-9] [^ ]/ {
++	$0 = $5 " 0x"$1 " 0x"$3 " load address 0x"$2;
++}
++
++# (LLD) Convert an object record from lld format to ld format.
++#
++ARGIND >= 4 && map_is_lld && NF == 5 && $5 ~ /:\(\./ {
++	gsub(/\)/, "");
++	sub(/:\(/, " ");
++	sub(/ vmlinux\.a\(/, " ");
++	$0 = " "$6 " 0x"$1 " 0x"$3 " " $5;
++}
++
++# (LLD) Convert a symbol record from lld format to ld format.
++#
++ARGIND >= 4 && map_is_lld && NF == 5 && $5 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {
++	$0 = "  0x" $1 " " $5;
++}
++
++# (LLD) We do not need any other ldd linker map records.
++#
++ARGIND >= 4 && map_is_lld && /^[0-9a-f]{16} / {
++	next;
++}
++
++# Handle section records with long section names (spilling onto a 2nd line).
++#
++ARGIND >= 4 && !map_is_lld && NF == 1 && /^[^ ]/ {
++	s = $0;
++	getline;
++	$0 = s " " $0;
++}
++
++# Next section - previous one is done.
++#
++ARGIND >= 4 && /^[^ ]/ {
++	sect = 0;
++}
++
++# Get the (top level) section name.
++#
++ARGIND >= 4 && /^[^ ]/ && $2 ~ /^0x/ && $3 ~ /^0x/ {
++	# Empty section or per-CPU section - ignore.
++	if (NF < 3 || $1 ~ /\.percpu/) {
++		sect = 0;
++		next;
++	}
++
++	sect = $1;
++
++	next;
++}
++
++# If we are not currently in a section we care about, ignore records.
++#
++!sect {
++	next;
++}
++
++# Handle object records with long section names (spilling onto a 2nd line).
++#
++ARGIND >= 4 && /^ [^ \*]/ && NF == 1 {
++	# If the section name is long, the remainder of the entry is found on
++	# the next line.
++	s = $0;
++	getline;
++	$0 = s " " $0;
++}
++
++# If the object is vmlinux.o, we need to consult vmlinux.o.map for per-object
++# symbol information
++#
++ARGIND == 4 && /^ [^ ]/ && NF == 4 {
++	idx = sect":"$1;
++	if (!(idx in sect_addend)) {
++		sect_addend[idx] = addr2val($2);
++		if (dbg)
++			printf "ADDEND %s = %016x\n", idx, sect_addend[idx] >"/dev/stderr";
++	}
++	if ($4 == "vmlinux.o") {
++		need_o_map = 1;
++		next;
++	}
++}
++
++# If data from vmlinux.o.map is needed, we only process section and object
++# records from vmlinux.map to determine which section we need to pay attention
++# to in vmlinux.o.map.  So skip everything else from vmlinux.map.
++#
++ARGIND == 4 && need_o_map {
++	next;
++}
++
++# Get module information for the current object.
++#
++ARGIND >= 4 && /^ [^ ]/ && NF == 4 {
++	msect = $1;
++	mod_name = get_module_info($4);
++	mod_eaddr = addr2val($2) + addr2val($3);
++
++	next;
++}
++
++# Process a symbol record.
++#
++# Evaluate the module information obtained from vmlinux.map (or vmlinux.o.map)
++# as follows:
++#  - For all symbols in a given object:
++#     - If the symbol is annotated with the same module name(s) that the object
++#       belongs to, count it as a match.
++#     - Otherwise:
++#        - If the symbol is known to have duplicates of which at least one is
++#          in a built-in module, disregard it.
++#        - If the symbol us not annotated with any module name(s) AND the
++#          object belongs to built-in modules, count it as missing.
++#        - Otherwise, count it as a mismatch.
++#
++ARGIND >= 4 && /^ / && NF == 2 && $1 ~ /^0x/ {
++	idx = sect":"msect;
++	if (!(idx in sect_addend))
++		next;
++
++	addr = addr2val($1);
++
++	# Handle the rare but annoying case where a 0-size symbol is placed at
++	# the byte *after* the module range.  Based on vmlinux.map it will be
++	# considered part of the current object, but it falls just beyond the
++	# module address range.  Unfortunately, its address could be at the
++	# start of another built-in module, so the only safe thing to do is to
++	# ignore it.
++	if (mod_name && addr == mod_eaddr)
++		next;
++
++	# If we are processing vmlinux.o.map, we need to apply the base address
++	# of the section to the relative address on the record.
++	#
++	if (ARGIND == 5)
++		addr += sect_addend[idx];
++
++	idx = addr"-"$2;
++	mod = "";
++	if (idx in sym2mod) {
++		mod = sym2mod[idx];
++		if (sym2mod[idx] == mod_name) {
++			mod_matches++;
++			matches++;
++		} else if (mod_name == "") {
++			print $2 " in " sym2mod[idx] " (should NOT be)";
++			mismatches++;
++		} else {
++			print $2 " in " sym2mod[idx] " (should be " mod_name ")";
++			mismatches++;
++		}
++	} else if (mod_name != "") {
++		print $2 " should be in " mod_name;
++		missing++;
++	} else
++		matches++;
++
++	total++;
++
++	next;
++}
++
++# Issue the comparison report.
++#
++END {
++	if (total) {
++		printf "Verification of %s:\n", ARGV[1];
++		printf "  Correct matches:  %6d (%d%% of total)\n", matches, 100 * matches / total;
++		printf "    Module matches: %6d (%d%% of matches)\n", mod_matches, 100 * mod_matches / matches;
++		printf "  Mismatches:       %6d (%d%% of total)\n", mismatches, 100 * mismatches / total;
++		printf "  Missing:          %6d (%d%% of total)\n", missing, 100 * missing / total;
++	}
++}
