@@ -127,8 +127,11 @@ name-fix = $(call stringify,$(call name-fix-token,$1))
 basename_flags = -DKBUILD_BASENAME=$(call name-fix,$(basetarget))
 modname_flags  = -DKBUILD_MODNAME=$(call name-fix,$(modname)) \
 		 -D__KBUILD_MODNAME=kmod_$(call name-fix-token,$(modname))
-modfile_flags  = -DKBUILD_MODFILE=$(call stringify,$(modfile)) \
-                 -DKBUILD_MODOBJS=$(call stringify,$(modfile).o:$(subst $(space),|,$(modname-objs-prefixed)))
+modfile_flags  = -DKBUILD_MODFILE=$(call stringify,$(modfile))
+
+ifdef CONFIG_CTF
+modfile_flags  += -DKBUILD_MODOBJS=$(call stringify,$(modfile).o:$(subst $(space),|,$(modname-objs-prefixed)))
+endif
 
 _c_flags       = $(filter-out $(CFLAGS_REMOVE_$(target-stem).o), \
                      $(filter-out $(ccflags-remove-y), \
