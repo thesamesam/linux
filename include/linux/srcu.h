@@ -524,4 +524,8 @@ DEFINE_LOCK_GUARD_1(srcu, struct srcu_struct,
 		    srcu_read_unlock(_T->lock, _T->idx),
 		    int idx)
 
+DEFINE_LOCK_GUARD_1(srcu_lite, struct srcu_struct,
+		    _T->idx = srcu_read_lock_lite(_T->lock),
+		    srcu_read_unlock_lite(_T->lock, _T->idx),
+		    int idx)
 #endif
